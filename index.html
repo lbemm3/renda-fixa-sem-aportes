@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Simulador de Renda Fixa — CDB, RDB e Tesouro SELIC</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font-family:sans-serif;background:#f9fafb;color:#1f2937}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo } = React;
+
+// ── IR regressivo — aplica-se sobre o ganho TOTAL no momento do resgate ───────
+// Base: dias corridos acumulados desde o início
+const aliquotaIR = (diasCorridos) => {
+  if (diasCorridos <= 180) return 0.225; // até 6 meses
+  if (diasCorridos <= 360) return 0.200; // 6 a 12 meses
+  if (diasCorridos <= 720) return 0.175; // 1 a 2 anos
+  return 0.150;                          // acima de 2 anos
+};
+
+const MESES_NOMES  = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
+                      'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+const MESES_CURTOS = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+const DIAS_UTEIS_MES   = 21;
+const DIAS_CORRIDOS_MES = 30;
+
+const fmtBRL = v => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(v);
+const fmtPct = (v, d=5) => v.toFixed(d) + '%';
+
+// ── Gráfico SVG ───────────────────────────────────────────────────────────────
+function Grafico({ periodos }) {
+  if (periodos.length < 2) return null;
+  const W=700, H=200, PL=56, PR=16, PT=12, PB=28;
+  const iW = W-PL-PR, iH = H-PT-PB;
+
+  const brutos  = periodos.map(p=>p.saldoBruto);
+  const liquidos = periodos.map(p=>p.saldoLiquidoSeResgatar);
+  const minV = Math.min(...liquidos) * 0.998;
+  const maxV = Math.max(...brutos)   * 1.001;
+  const toY  = v => PT + iH - ((v-minV)/(maxV-minV))*iH;
+  const toX  = i => PL + (i/(periodos.length-1))*iW;
+
+  const ptsB = periodos.map((p,i)=>`${toX(i)},${toY(p.saldoBruto)}`).join(' ');
+  const ptsL = periodos.map((p,i)=>`${toX(i)},${toY(p.saldoLiquidoSeResgatar)}`).join(' ');
+
+  const yticks = 4;
+  const xtickStep = Math.ceil(periodos.length/8);
+
+  return (
+    <div>
+      <div className="flex gap-4 text-xs mb-2">
+        <span className="flex items-center gap-1"><span className="inline-block w-6 h-0.5 bg-blue-500"></span>Saldo Bruto</span>
+        <span className="flex items-center gap-1"><span className="inline-block w-6 h-0.5 bg-green-500"></span>Saldo Líq. (se resgatar)</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{height:'180px'}}>
+        <defs>
+          <linearGradient id="gb" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.15"/>
+            <stop offset="100%" stopColor="#3b82f6" stopOpacity="0"/>
+          </linearGradient>
+        </defs>
+        {/* grade Y */}
+        {Array.from({length:yticks+1},(_,i)=>{
+          const v = minV + (maxV-minV)*i/yticks;
+          const y = toY(v);
+          return (
+            <g key={i}>
+              <line x1={PL} y1={y} x2={W-PR} y2={y} stroke="#e5e7eb" strokeWidth="1"/>
+              <text x={PL-4} y={y+3} textAnchor="end" fontSize="9" fill="#9ca3af">
+                {(v/1000).toFixed(0)}k
+              </text>
+            </g>
+          );
+        })}
+        {/* área bruta */}
+        <polygon points={`${toX(0)},${H-PB} ${ptsB} ${toX(periodos.length-1)},${H-PB}`} fill="url(#gb)"/>
+        {/* linha bruta */}
+        <polyline points={ptsB} fill="none" stroke="#3b82f6" strokeWidth="2"/>
+        {/* linha líquida */}
+        <polyline points={ptsL} fill="none" stroke="#16a34a" strokeWidth="1.5" strokeDasharray="4,3"/>
+        {/* labels X */}
+        {periodos.filter((_,i)=>i%xtickStep===0||i===periodos.length-1).map((p,i)=>{
+          const idx=periodos.indexOf(p);
+          return <text key={i} x={toX(idx)} y={H-6} textAnchor="middle" fontSize="8" fill="#6b7280">{p.periodo}</text>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+  const [capitalInicial, setCapitalInicial] = useState(50000);
+  const [taxaMediaAnual, setTaxaMediaAnual] = useState(13.50);
+  const [mesInicio,      setMesInicio]      = useState(11);
+  const [anoInicio,      setAnoInicio]      = useState(2024);
+  const [numeroMeses,    setNumeroMeses]    = useState(60);
+  const [aba,            setAba]            = useState('tabela');
+
+  const taxaFundo   = (taxaMediaAnual / 100) - 0.001;
+  const taxaDiaria  = Math.pow(1 + taxaFundo, 1/252) - 1;
+  const fatorMensal = Math.pow(1 + taxaDiaria, DIAS_UTEIS_MES);
+
+  // ── Cálculo correto: saldo cresce BRUTO; IR só no resgate ──────────────────
+  const { periodos, saldoBrutoFinal } = useMemo(() => {
+    let saldo = capitalInicial;
+    const ps = [];
+    for (let i = 0; i < numeroMeses; i++) {
+      const mesIdx   = (mesInicio - 1 + i) % 12;
+      const anoAtual = anoInicio + Math.floor((mesInicio - 1 + i) / 12);
+      const saldoInicial   = saldo;
+      const rendBruto      = saldoInicial * fatorMensal - saldoInicial;
+      const saldoBruto     = saldoInicial + rendBruto;
+
+      // Simulação: "e se resgatar agora?"
+      const diasCorridos         = (i + 1) * DIAS_CORRIDOS_MES;
+      const aliq                 = aliquotaIR(diasCorridos);
+      const ganhoTotal           = saldoBruto - capitalInicial;
+      const irSeResgatar         = Math.max(0, ganhoTotal) * aliq;
+      const saldoLiquidoSeResgatar = saldoBruto - irSeResgatar;
+
+      ps.push({
+        periodo: `${MESES_CURTOS[mesIdx]}/${anoAtual}`,
+        mes: i + 1,
+        diasCorridos,
+        saldoInicial,
+        rendimentoBruto: rendBruto,
+        saldoBruto,
+        aliquota: aliq,
+        irSeResgatar,
+        saldoLiquidoSeResgatar,
+      });
+      saldo = saldoBruto; // saldo cresce bruto, sem desconto mensal
+    }
+    return { periodos: ps, saldoBrutoFinal: saldo };
+  }, [capitalInicial, taxaMediaAnual, mesInicio, anoInicio, numeroMeses]);
+
+  // IR e resultado final
+  const diasCorridosTotal   = numeroMeses * DIAS_CORRIDOS_MES;
+  const aliquotaFinal       = aliquotaIR(diasCorridosTotal);
+  const ganhoTotal          = saldoBrutoFinal - capitalInicial;
+  const irFinal             = ganhoTotal * aliquotaFinal;
+  const saldoLiquidoFinal   = saldoBrutoFinal - irFinal;
+
+  const badge = aliq => {
+    if (aliq===0.225) return 'bg-red-100 text-red-700';
+    if (aliq===0.200) return 'bg-orange-100 text-orange-700';
+    if (aliq===0.175) return 'bg-yellow-100 text-yellow-700';
+    return 'bg-green-100 text-green-700';
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 md:p-6">
+      <div className="max-w-6xl mx-auto">
+
+        <div className="mb-5 rounded-2xl bg-gradient-to-r from-blue-700 to-emerald-600 text-white px-5 py-5 shadow">
+          <h1 className="text-2xl md:text-3xl font-bold">Simulador de Renda Fixa</h1>
+          <p className="text-blue-50 text-sm mt-1">CDB, RDB e Tesouro SELIC — IR descontado apenas no resgate</p>
+          <span className="inline-block mt-3 text-xs font-medium bg-white/20 rounded-full px-3 py-1">Versão sem aportes · capital inicial único</span>
+        </div>
+
+        {/* Parâmetros */}
+        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 mb-5">
+          <h2 className="font-semibold text-gray-800 mb-4">Parâmetros</h2>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+            {[
+              ['Capital Inicial (R$)',         capitalInicial, setCapitalInicial, 0,    null, 1000],
+              ['Taxa Selic Projetada (% aa)',   taxaMediaAnual, setTaxaMediaAnual, 0,    50,   0.01],
+              ['Ano de Início',                 anoInicio,      setAnoInicio,      2020, 2050, 1],
+              ['Número de Meses',               numeroMeses,    setNumeroMeses,    1,    360,  1],
+            ].map(([lbl,val,setter,mn,mx,step])=>(
+              <div key={lbl}>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">{lbl}</label>
+                <input type="number" value={val} onChange={e=>setter(Number(e.target.value))}
+                  min={mn} max={mx||undefined} step={step}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"/>
+              </div>
+            ))}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Mês de Início</label>
+              <select value={mesInicio} onChange={e=>setMesInicio(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                {MESES_NOMES.map((m,i)=><option key={i} value={i+1}>{m}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Premissas */}
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 mb-5 text-sm">
+          <h2 className="font-semibold text-blue-900 mb-2">Premissas</h2>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-x-8 gap-y-1 text-blue-800 mb-3">
+            <div>Capital inicial: <strong>{fmtBRL(capitalInicial)}</strong></div>
+            <div>Selic projetada: <strong>{taxaMediaAnual.toFixed(2)}% aa</strong></div>
+            <div>Taxa do fundo: <strong>{(taxaMediaAnual - 0.10).toFixed(2)}% aa</strong> (Selic − 0,10%)</div>
+            <div>Taxa diária equiv.: <strong>{fmtPct(taxaDiaria*100)}</strong></div>
+            <div>Dias úteis/mês: <strong>{DIAS_UTEIS_MES}</strong></div>
+            <div>IR: <strong>regressivo, no resgate</strong></div>
+          </div>
+
+          <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
+            <strong>⚠️ Importante:</strong> Para CDB, RDB e Tesouro SELIC, o IR incide sobre o <strong>ganho total</strong> apenas no momento do resgate,
+            com alíquota regressiva conforme o prazo. A tabela abaixo mostra o saldo bruto crescendo mês a mês,
+            e o que seria o saldo líquido <em>caso o resgate ocorresse naquele mês</em>.
+          </div>
+
+          <div className="mt-2 flex flex-wrap gap-2">
+            {[['≤ 180 dias (≤ 6 meses)','22,5%','bg-red-100 text-red-700'],
+              ['181–360 dias (6–12 meses)','20,0%','bg-orange-100 text-orange-700'],
+              ['361–720 dias (1–2 anos)','17,5%','bg-yellow-100 text-yellow-700'],
+              ['> 720 dias (> 2 anos)','15,0%','bg-green-100 text-green-700'],
+            ].map(([p,a,c])=>(
+              <span key={p} className={`px-2 py-0.5 rounded-full text-xs font-medium ${c}`}>{p}: {a}</span>
+            ))}
+          </div>
+        </div>
+
+        {/* Abas */}
+        <div className="flex gap-2 mb-4">
+          {[['tabela','📋 Tabela Mensal'],['grafico','📈 Evolução do Saldo'],['metodologia','📖 Metodologia']].map(([id,lbl])=>(
+            <button key={id} onClick={()=>setAba(id)}
+              className={'px-4 py-2 rounded-full font-medium text-sm transition-colors '+(aba===id?'bg-blue-700 text-white shadow':'bg-white text-gray-600 border border-gray-200 hover:bg-blue-50')}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+
+        {/* Tabela */}
+        {aba==='tabela' && (
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mb-5">
+            <div className="overflow-auto" style={{maxHeight:'460px'}}>
+              <table className="w-full text-sm border-collapse">
+                <thead className="bg-gray-100 sticky top-0 z-10">
+                  <tr>
+                    {['Período','Mês #','Saldo Bruto Inicial','Rendimento Bruto','Saldo Bruto Acum.','Alíq. IR','IR (se resgatar)','Saldo Líq. (se resgatar)'].map(h=>(
+                      <th key={h} className="border border-gray-200 px-3 py-2 text-left font-semibold text-gray-700 whitespace-nowrap text-xs">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {periodos.map((p,i)=>(
+                    <tr key={i} className={i%2===0?'bg-white':'bg-gray-50'}>
+                      <td className="border border-gray-200 px-3 py-1.5 font-medium">{p.periodo}</td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-center">{p.mes}</td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-right">{fmtBRL(p.saldoInicial)}</td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-right text-blue-600">{fmtBRL(p.rendimentoBruto)}</td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-right font-semibold">{fmtBRL(p.saldoBruto)}</td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-center">
+                        <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${badge(p.aliquota)}`}>
+                          {(p.aliquota*100).toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-right text-red-500 text-xs">{fmtBRL(p.irSeResgatar)}</td>
+                      <td className="border border-gray-200 px-3 py-1.5 text-right font-semibold text-green-700">{fmtBRL(p.saldoLiquidoSeResgatar)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Gráfico */}
+        {aba==='grafico' && (
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 mb-5">
+            <h2 className="font-semibold text-gray-800 mb-1">Evolução do Saldo ao Longo dos {numeroMeses} Meses</h2>
+            <p className="text-xs text-gray-400 mb-3">Saldo bruto (linha azul) e saldo líquido caso resgate naquele mês (linha verde tracejada)</p>
+            <Grafico periodos={periodos}/>
+          </div>
+        )}
+
+        {aba==='metodologia' && (
+          <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 mb-5 text-sm text-gray-700 space-y-4">
+            <h2 className="font-semibold text-gray-800 text-base">Metodologia</h2>
+            <div>
+              <h3 className="font-semibold text-gray-800 mb-1">1. Taxa do fundo</h3>
+              <p>Considera-se CDI = Selic projetada − 0,10% ao ano. A Selic é mantida constante durante todo o período simulado.</p>
+              <p className="mt-1 font-mono text-xs bg-gray-50 border border-gray-200 rounded p-2">taxa do fundo = (Selic/100) − 0,001</p>
+            </div>
+            <div>
+              <h3 className="font-semibold text-gray-800 mb-1">2. Taxa diária e fator mensal</h3>
+              <p>A taxa anual é convertida em taxa diária por dias úteis (252 por ano) e capitalizada por 21 dias úteis em cada mês.</p>
+              <p className="mt-1 font-mono text-xs bg-gray-50 border border-gray-200 rounded p-2">taxa diária = (1 + taxa do fundo)^(1/252) − 1<br/>fator mensal = (1 + taxa diária)^21</p>
+            </div>
+            <div>
+              <h3 className="font-semibold text-gray-800 mb-1">3. Evolução do saldo bruto</h3>
+              <p>O saldo cresce bruto, sem desconto de IR mês a mês. Em cada mês, o rendimento é o saldo do início do mês multiplicado pelo fator mensal, menos o próprio saldo.</p>
+              <p className="mt-1 font-mono text-xs bg-gray-50 border border-gray-200 rounded p-2">saldo bruto(t) = saldo bruto(t−1) × fator mensal</p>
+            </div>
+            <div>
+              <h3 className="font-semibold text-gray-800 mb-1">4. Imposto de Renda regressivo</h3>
+              <p>O IR incide apenas no resgate, sobre o <strong>ganho total</strong> (saldo bruto − capital inicial). A alíquota depende dos dias corridos desde o início, contados como 30 dias por mês:</p>
+              <ul className="list-disc ml-5 mt-1">
+                <li>até 180 dias: 22,5%</li>
+                <li>181 a 360 dias: 20,0%</li>
+                <li>361 a 720 dias: 17,5%</li>
+                <li>acima de 720 dias: 15,0%</li>
+              </ul>
+              <p className="mt-1 font-mono text-xs bg-gray-50 border border-gray-200 rounded p-2">IR = máx(0, saldo bruto − capital inicial) × alíquota<br/>saldo líquido = saldo bruto − IR</p>
+            </div>
+            <div>
+              <h3 className="font-semibold text-gray-800 mb-1">5. Leitura da tabela</h3>
+              <p>As colunas “IR (se resgatar)” e “Saldo Líq. (se resgatar)” mostram o que você receberia caso resgatasse naquele mês. Elas não são descontos efetivos: o saldo bruto continua rendendo normalmente.</p>
+            </div>
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
+              <strong>Limitações:</strong> não há aportes (use a versão com aportes para isso), nem IOF, nem taxa de custódia, e a Selic é constante. Os valores reais dependem do emissor, do produto e da data exata do resgate. Simulação para fins educacionais.
+            </div>
+          </div>
+        )}
+
+        {/* Resultado Final */}
+        <div className="bg-green-50 border border-green-200 rounded-xl p-5">
+          <h2 className="font-semibold text-green-900 mb-4">
+            Resultado no Resgate — {numeroMeses} {numeroMeses===1?'mês':'meses'}
+            <span className={`ml-2 text-xs font-medium px-2 py-0.5 rounded-full ${badge(aliquotaFinal)}`}>
+              IR {(aliquotaFinal*100).toFixed(1)}% (prazo {'>'} {diasCorridosTotal<=180?'0':diasCorridosTotal<=360?'180':diasCorridosTotal<=720?'360':'720'} dias)
+            </span>
+          </h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[
+              ['Capital Inicial',      fmtBRL(capitalInicial),     'text-gray-800'],
+              ['Saldo Bruto Final',    fmtBRL(saldoBrutoFinal),    'text-blue-700 font-bold'],
+              ['IR sobre Ganho Total', fmtBRL(irFinal),            'text-red-600 font-bold'],
+              ['Saldo Líquido Final',  fmtBRL(saldoLiquidoFinal),  'text-green-700 font-bold'],
+            ].map(([lbl,val,cls])=>(
+              <div key={lbl} className="bg-white rounded-lg p-3 border border-green-100">
+                <p className="text-xs text-gray-500 mb-1">{lbl}</p>
+                <p className={`text-base ${cls}`}>{val}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4 pt-4 border-t border-green-200 grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
+            <div className="flex justify-between">
+              <span className="text-gray-600">Ganho bruto:</span>
+              <span className="font-semibold">{fmtBRL(ganhoTotal)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-600">Retorno líquido:</span>
+              <span className="font-semibold">{((saldoLiquidoFinal/capitalInicial - 1)*100).toFixed(2)}%</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-600">Patrimônio / capital:</span>
+              <span className="font-semibold">{((saldoLiquidoFinal/capitalInicial)*100).toFixed(2)}%</span>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-center text-xs text-gray-400 mt-5">
+          Simulação para fins educacionais. Não constitui recomendação de investimento.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
